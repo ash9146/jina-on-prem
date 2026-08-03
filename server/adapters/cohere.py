@@ -19,10 +19,10 @@ from pydantic import BaseModel, ConfigDict, Field
 import engine
 import serialize
 from errors import BadRequest, JinaError, request_id
-from media import _bytes_to_st_input as bytes_to_st_input, _decode_b64 as decode_b64
+from media import _from_url_or_data as from_url_or_data
 from media import fuse_content
 
-from .jina import INPUT_TYPE_TASKS, reject_foreign_model
+from .jina import input_type_task, reject_foreign_model
 
 router = APIRouter(tags=["Cohere"])
 
@@ -58,14 +58,14 @@ class RerankRequest(BaseModel):
     query: str
     documents: list[str] = Field(min_length=1)
     top_n: Optional[int] = Field(default=None, ge=1)
-    max_tokens_per_doc: int = DEFAULT_MAX_TOKENS_PER_DOC
+    max_tokens_per_doc: int = Field(default=DEFAULT_MAX_TOKENS_PER_DOC, ge=1, le=8192)
     priority: Optional[int] = None
 
 
 @router.post("/v2/embed")
 def embed(request: EmbedRequest):
     reject_foreign_model(request.model)
-    task = INPUT_TYPE_TASKS.get(request.input_type, "retrieval")
+    task = input_type_task(request.input_type)
 
     if request.inputs is not None:
         engine.require_multimodal()
@@ -73,7 +73,7 @@ def embed(request: EmbedRequest):
         texts, image_count = [], len(items)
     elif request.images is not None:
         engine.require_multimodal()
-        items = [bytes_to_st_input(*decode_b64(url)) for url in request.images]
+        items = [from_url_or_data(url)[0] for url in request.images]
         texts, image_count = request.texts or [], len(request.images)
     else:
         items = request.texts or []
@@ -143,16 +143,10 @@ def rerank(request: RerankRequest):
 
 
 def encode(vector: np.ndarray, kind: str):
-    """Cohere's `embedding_types` covers Jina's four plus int8 / uint8.
-
-    The int8 / uint8 mapping is the symmetric one for unit-norm vectors --
-    Cohere does not publish its quantiser, so these are correctly *ranged* but
-    not bit-comparable with Cohere's own output.
-    """
-    if kind == "int8":
-        return np.clip(np.rint(np.asarray(vector) * 127), -128, 127).tolist()
-    if kind == "uint8":
-        return np.clip(np.rint((np.asarray(vector) + 1) * 127.5), 0, 255).tolist()
+    """Cohere's `embedding_types` is Jina's four plus int8 / uint8, and its
+    `base64` is float bytes rather than a sixth set of numbers."""
+    if kind == "base64":
+        return serialize.encode_vector(vector, "float", as_base64=True)
     return serialize.encode_vector(vector, kind)
 
 

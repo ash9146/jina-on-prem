@@ -17,7 +17,14 @@ class ModelSpec:
     type: str
     family: str
     modality: str
+    # What the model does, for humans and the generated catalog table.
     tasks: tuple
+    # What `task` accepts on the wire, verbatim: the exact strings, not base
+    # names with suffix algebra. These differ in kind, not just in accuracy --
+    # v3 *does* retrieval, and the string `retrieval` is not something it takes.
+    # Empty means the public API declares no `task` field for this model, so
+    # there is nothing to check a value against and it is passed through.
+    task_enum: tuple
     api_endpoint: str
     context: int
     output_dim: Optional[int] = None
@@ -40,6 +47,15 @@ def _load() -> dict:
 _catalog: dict = _load()
 
 
+def is_known(model_id: str) -> bool:
+    """Does this project ship that model at all?
+
+    The difference decides what a wrong `model` field is told to do: pull a
+    different image of ours, or stop naming another vendor's model.
+    """
+    return model_id.split("/")[-1] in _catalog or model_id in _catalog
+
+
 def spec_for(model_id: str) -> ModelSpec:
     short_id = model_id.split("/")[-1] if "/" in model_id else model_id
     entry = _catalog.get(short_id) or _catalog.get(model_id)
@@ -56,6 +72,7 @@ def spec_for(model_id: str) -> ModelSpec:
         family=entry["family"],
         modality=entry["modality"],
         tasks=tuple(entry.get("tasks", [])),
+        task_enum=tuple(entry.get("task_enum", [])),
         api_endpoint=entry["api_endpoint"],
         context=entry.get("context", 0),
         output_dim=entry.get("output_dim"),

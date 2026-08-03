@@ -7,12 +7,19 @@ rewrite is measured against.
 The request deliberately accepts each provider's field names as aliases,
 because the public API does exactly the same thing (`AliasChoices` throughout
 `sefo-gcp` `models/embedding.py` and `models/reranking.py`): OpenAI's
-`encoding_format`, Voyage's `output_dtype` / `truncation` / `top_k`, Gemini's
-`task_type` / `output_dimensionality`, Cohere's `texts` / `max_tokens_per_doc`.
-That is a field union, not an adapter. Anything a provider has that Jina does
-not -- OpenAI's `user`, Cohere's `priority` -- is accepted and ignored by
+`encoding_format`, Voyage's `truncation` / `top_k`, Gemini's `task_type` /
+`output_dimensionality`, Cohere's `texts` / `max_tokens_per_doc`. That is a
+field union, not an adapter. Anything a provider has that Jina does not --
+OpenAI's `user`, Cohere's `priority` -- is accepted and ignored by
 `extra="ignore"`; anything that changes semantics lives in that provider's
 adapter.
+
+An alias is only right where the two fields mean the same thing. Voyage's
+`output_dtype` is not aliased onto `embedding_type` for that reason, and where
+the same field carries different *defaults* -- Voyage truncates by default,
+Jina and OpenAI refuse -- the divergence is documented rather than papered
+over, because `/v1/embeddings` is all three vendors' published path and
+nothing on the wire says which client sent the request.
 """
 
 from typing import Literal, Optional, Union
@@ -27,31 +34,20 @@ from pydantic import (
     model_validator,
 )
 
+import catalog
 import engine
 import serialize
+import tasks
 from config import settings
 from errors import (
     BadRequest,
     JinaError,
-    UnprocessableEntity,
     jina_error_body,
     jina_validation_body,
 )
 from media import _parse_openai_item as parse_openai_item
 
 router = APIRouter(tags=["Jina"])
-
-# Voyage and Cohere both express "is this a query or a document" as
-# `input_type`; Jina expresses it as a task suffix. Same concept, so it maps
-# rather than living in an adapter.
-INPUT_TYPE_TASKS = {
-    "query": "retrieval.query",
-    "document": "retrieval.passage",
-    "search_query": "retrieval.query",
-    "search_document": "retrieval.passage",
-    "classification": "classification",
-    "clustering": "clustering",
-}
 
 # Native parameters that change the forward pass rather than the wire format.
 # Forwarded only when the loaded model's encode() genuinely takes them.
@@ -85,9 +81,15 @@ class EmbeddingsRequest(BaseModel):
             "embedding_type",
             "encoding_type",
             "encoding_format",
-            "output_dtype",
             "embedding_types",
         ),
+    )
+    # Voyage's, and deliberately not an alias of the field above: theirs are
+    # two orthogonal choices -- which numbers, and whether to base64 them --
+    # where Jina's one field encodes four of the pairs. Aliased together, the
+    # first one pydantic matched silently discarded the other.
+    output_dtype: Optional[Literal["float", "int8", "uint8", "binary", "ubinary"]] = (
+        None
     )
     late_chunking: bool = False
     return_multivector: bool = False
@@ -97,21 +99,48 @@ class EmbeddingsRequest(BaseModel):
     @field_validator("embedding_type", mode="before")
     @classmethod
     def _single_value(cls, value):
-        # The public API types this as `Union[Literal, List[Literal]]` but
-        # returns HTTP 500 on the list form. Reject it at validation rather
-        # than reproduce the crash.
+        # Cohere's spelling of this field is a list, because Cohere returns
+        # every type asked for at once. This envelope has one `embedding` key
+        # per item and nowhere to put a second encoding, so a one-element list
+        # is unwrapped and a longer one is sent to the route that can answer
+        # it. (The public API types this as `Union[Literal, List[Literal]]`
+        # and returns HTTP 500 on the list form; that is not worth copying.)
         if isinstance(value, list):
+            if len(value) == 1:
+                return value[0]
             raise ValueError(
-                "embedding_type must be a single value, not a list. Accepted: "
-                + ", ".join(serialize.EMBEDDING_TYPES)
+                "embedding_type takes one value here; POST /v2/embed returns "
+                "several at once. Accepted: " + ", ".join(serialize.NATIVE_TYPES)
             )
         return value if value is not None else "float"
 
-    @field_validator("input")
+    @field_validator("input", mode="before")
     @classmethod
     def _non_empty(cls, value):
         if isinstance(value, list) and not value:
             raise ValueError("Input list cannot be empty. Provide at least one item.")
+        # OpenAI's `input` also takes pre-tokenised ids -- `[1212, 318]` or a
+        # list of those. It is the one thing on this surface that genuinely
+        # cannot be translated: the ids are cl100k_base, decoding them needs
+        # OpenAI's vocabulary, and shipping that in an offline image is not an
+        # option. Say which text to send instead of letting the type union
+        # reject it as "input.str: Input should be a valid string" three times
+        # over, which reads like the text itself was wrong.
+        items = value if isinstance(value, list) else [value]
+        if any(
+            isinstance(item, int)
+            or (
+                isinstance(item, list)
+                and item
+                and all(isinstance(x, int) for x in item)
+            )
+            for item in items
+        ):
+            raise ValueError(
+                "Token-id input is not supported: the ids would have to be "
+                "decoded with the tokenizer that produced them, which is not "
+                "in this image. Send the original text instead."
+            )
         return value
 
     @model_validator(mode="after")
@@ -140,11 +169,21 @@ class RerankRequest(BaseModel):
         default=None, ge=1, validation_alias=AliasChoices("top_n", "top_k")
     )
     return_documents: bool = True
+    # Only jina-reranker-v3 / v3.5 form a document vector on the way to a
+    # score; every other reranker here is refused rather than answered without
+    # one. Public API parity: those two return a 512-dim unit vector per result.
+    return_embeddings: bool = False
     max_doc_length: Optional[int] = Field(
         default=None,
         ge=1,
         le=8192,
         validation_alias=AliasChoices("max_doc_length", "max_tokens_per_doc"),
+    )
+    # Voyage's rerank has this and means it: false is "raise rather than trim".
+    # Default true because that is both Voyage's default and what this route
+    # already did.
+    truncate: bool = Field(
+        default=True, validation_alias=AliasChoices("truncate", "truncation")
     )
 
 
@@ -154,18 +193,13 @@ def create_embeddings(request: EmbeddingsRequest):
     requests, which differ from Jina's only in field naming."""
     reject_foreign_model(request.model)
     family = engine.embedding_family()
-    check_task(family, request.task)
-    check_dimensions(request.dimensions)
-
-    items = embedding_items(request.input)
-    enforce_truncation(items, request.truncate)
-
     vectors, n_tokens, _ = engine.embed(
-        items,
+        embedding_items(request.input),
         task=resolve_task(request),
         dimensions=request.dimensions,
         normalized=request.normalized,
         extra=inference_kwargs(family, request),
+        truncate=request.truncate,
     )
     return serialize.embeddings_response(
         settings.short_model_id,
@@ -185,7 +219,9 @@ def rerank(request: RerankRequest):
         request.documents,
         top_n=request.top_n,
         return_documents=request.return_documents,
+        return_embeddings=request.return_embeddings,
         max_doc_length=request.max_doc_length,
+        truncate=request.truncate,
     )
     return serialize.rerank_response(
         settings.short_model_id,
@@ -214,36 +250,58 @@ def reject_foreign_model(requested: Optional[str]) -> None:
         return
     if requested.split("/")[-1] == settings.short_model_id:
         return
+    remedy = (
+        f"One model per image: run the '{requested}' image instead, set "
+        f"'model' to '{settings.short_model_id}', or drop the field."
+        if catalog.is_known(requested)
+        # Telling them to run the 'text-embedding-3-small' image would send
+        # them after something that does not exist.
+        else f"'{requested}' is not a model this project ships. Set 'model' "
+        f"to '{settings.short_model_id}', or drop the field."
+    )
     raise BadRequest(
-        f"This image serves '{settings.short_model_id}', not '{requested}'. "
-        f"One model per image: point the client at the '{requested}' image, "
-        f"set 'model' to '{settings.short_model_id}', or drop the field.",
+        f"This image serves '{settings.short_model_id}', not '{requested}'. " + remedy,
         field="model",
     )
 
 
-def check_task(family, task: Optional[str]) -> None:
-    """Reject a task the loaded model does not know, so a typo cannot silently
-    select a different LoRA adapter."""
-    if not task:
-        return
-    known = family.known_tasks
-    if not known:
-        return
-    if task.partition(".")[0] in known or task in (family.prompts or ()):
-        return
-    raise BadRequest(
-        f"Unknown task '{task}' for {settings.short_model_id}. "
-        f"This model accepts: {', '.join(sorted(known))} "
-        f"(optionally suffixed .query or .passage).",
-        field="task",
-    )
-
-
 def resolve_task(request: EmbeddingsRequest) -> Optional[str]:
+    """Whichever field the caller used to say what the text is for.
+
+    ``task_type`` is an accepted alias for ``task``, and it is Gemini's
+    spelling -- so accepting the name while rejecting the values it can hold
+    left a Gemini-shaped client failing on a field we advertise. The two
+    namespaces do not overlap (``RETRIEVAL_QUERY`` against ``retrieval.query``),
+    so a value from theirs is translated and everything else is Jina's own,
+    refused by the core if it is wrong.
+    """
     if request.input_type:
-        return INPUT_TYPE_TASKS.get(request.input_type, "retrieval")
+        return input_type_task(request.input_type)
+    if not request.task:
+        return None
+    roles = tasks.TASK_TYPE_ROLES.get(request.task)
+    if roles:
+        return engine.fit_task(*roles, field="task", value=request.task)
     return request.task
+
+
+def input_type_task(input_type: Optional[str]) -> Optional[str]:
+    """A vendor's ``input_type``, as a task this model has.
+
+    Shared by every schema with this field, and there are three answers, not
+    two. A value in the vendor's enum is fitted to the model. A task this
+    model serves is taken as written, even though the vendor has no such value
+    -- their enum is a limit on their models, not on ours. Anything else is a
+    typo and is refused, as the vendor would refuse it.
+    """
+    if not input_type:
+        return None
+    roles = tasks.INPUT_TYPE_ROLES.get(input_type)
+    if roles is not None:
+        return engine.fit_task(*roles, field="input_type", value=input_type)
+    return engine.named_task(
+        input_type, field="input_type", vendor_values=tasks.INPUT_TYPE_ROLES
+    )
 
 
 def embedding_items(raw: Union[str, dict, list]) -> list:
@@ -263,43 +321,6 @@ def embedding_items(raw: Union[str, dict, list]) -> list:
     if any(not isinstance(part, str) for parts in parsed for part in parts):
         engine.require_multimodal()
     return [parts[0] if len(parts) == 1 else parts for parts in parsed]
-
-
-def check_dimensions(dimensions: Optional[int]) -> None:
-    """The public API caps `dimensions` at the model's own output dimension and
-    422s above it; without the check a too-large value silently no-ops."""
-    limit = engine.SPEC.output_dim
-    if dimensions and limit and dimensions > limit:
-        raise UnprocessableEntity(
-            f"Input should be less than or equal to {limit}",
-            field="body -> dimensions",
-            code="less_than_equal",
-        )
-
-
-def enforce_truncation(items: list, truncate: bool) -> None:
-    """`truncate=false` (the default) means "error rather than silently
-    shorten". Measured on api.jina.ai: over-length input returns HTTP 400
-    `INPUT_TOKEN_LIMIT_EXCEEDED`, and only `truncate=true` succeeds. Left to
-    sentence-transformers the input would be clipped with nothing on the wire
-    to say so, which changes the embedding invisibly."""
-    if truncate:
-        return
-    limit = engine.SPEC.context
-    if not limit:
-        return
-    for item in items:
-        if not isinstance(item, str):
-            continue
-        tokens = engine.count_tokens([item])
-        if tokens > limit:
-            raise BadRequest(
-                f"Input text exceeds the model's maximum of {limit} tokens. "
-                f"Use 'truncate: true' to automatically truncate, or split "
-                f"into smaller chunks.",
-                field="input",
-                code="INPUT_TOKEN_LIMIT_EXCEEDED",
-            )
 
 
 def inference_kwargs(family, request: EmbeddingsRequest) -> dict:
@@ -329,13 +350,18 @@ def inference_kwargs(family, request: EmbeddingsRequest) -> dict:
 
 
 def embedding_data(vectors, request: EmbeddingsRequest) -> list:
+    dtype, as_base64 = serialize.NATIVE_TYPES[request.embedding_type]
+    if request.output_dtype:
+        # More specific than the shorthand: it names the numbers outright,
+        # leaving the shorthand to say only whether they are base64.
+        dtype = request.output_dtype
     if request.return_multivector:
         return [
-            serialize.multivector_item(index, matrix, request.embedding_type)
+            serialize.multivector_item(index, matrix, dtype, as_base64=as_base64)
             for index, matrix in enumerate(vectors)
         ]
     return [
-        serialize.embedding_item(index, vector, request.embedding_type)
+        serialize.embedding_item(index, vector, dtype, as_base64=as_base64)
         for index, vector in enumerate(vectors)
     ]
 

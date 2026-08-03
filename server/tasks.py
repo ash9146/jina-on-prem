@@ -1,4 +1,4 @@
-"""Task-string vocabulary shared by the embedding families.
+"""Every task vocabulary: ours, the model families', and the other vendors'.
 
 The API-level task string carries two pieces of information that different
 model families consume in different ways:
@@ -16,7 +16,8 @@ model families consume in different ways:
    ``ValueError: Prompt name 'X' not found in...``.
 
 Each family applies these two rules its own way in ``families.embedding``;
-what lives here is the shared vocabulary those rules are written against.
+what lives here is the shared vocabulary those rules are written against --
+plus, at the bottom, the other vendors' vocabularies and what they mean.
 """
 
 from typing import Optional
@@ -40,18 +41,13 @@ _DEFAULTS = {
     "code-embeddings": "nl2code.query",
 }
 
-# v3's task vocabulary IS ``retrieval.query`` / ``retrieval.passage``, so the
-# suffix is preserved rather than collapsed. Unknown tasks fall back to
-# ``retrieval.passage``.
-V3_TASKS = {
-    "retrieval": "retrieval.passage",
-    "retrieval.query": "retrieval.query",
-    "retrieval.passage": "retrieval.passage",
-    "text-matching": "text-matching",
-    "classification": "classification",
-    "clustering": "text-matching",
-    "separation": "separation",
-}
+# v3 needs no table: its prompts are keyed by the task name itself, so the
+# published enum's strings are already what ``map_prompt_name`` looks up. The
+# table that used to be here translated a suffix-less ``retrieval`` alias the
+# public API does not accept, and defaulted everything it did not recognise to
+# ``retrieval.passage`` -- which is how ``clustering`` (v3's clustering adapter
+# is named ``separation``, arXiv 2409.10173 s4.3.5) and ``classification.query``
+# came back as retrieval vectors with a 200 on them.
 
 # v5's custom encode only accepts the bare base task, so the .query/.passage
 # suffix is collapsed here and carried into ``prompt_name`` instead.
@@ -121,3 +117,52 @@ def map_prompt_name(task: str, prompts: Optional[dict]) -> Optional[str]:
             None,
         )
     return next((k for k in ("document", "query") if k in prompts), None)
+
+
+# --- other vendors' vocabularies -------------------------------------------
+#
+# Each entry is ``(preferred task families, retrieval role)``. Neither half is
+# a task on its own: ``engine.fit_task`` turns the pair into a task the LOADED
+# model actually has, most specific family first.
+#
+# It has to work that way because these fields are closed single-choice lists.
+# A Cohere client cannot say ``nl2code`` -- Cohere has no such value -- so a
+# code-embeddings image reached through Cohere's schema would refuse every
+# request its caller is capable of sending. What the caller *can* express is
+# the role, and that is what survives the translation.
+#
+# An empty family tuple with no role means the vendor spelled out "unspecified"
+# rather than omitting the field, which is the model's own default.
+
+QUERY = "query"
+PASSAGE = "passage"
+
+# Cohere `input_type` (all five published values) and Voyage `input_type`
+# (query / document). Jina's own query / document spellings ride along.
+INPUT_TYPE_ROLES = {
+    "query": (("retrieval",), QUERY),
+    "search_query": (("retrieval",), QUERY),
+    "document": (("retrieval",), PASSAGE),
+    "search_document": (("retrieval",), PASSAGE),
+    "classification": (("classification",), None),
+    # Most families call it ``clustering``; v3 calls the same adapter
+    # ``separation``. Offering both, most-shared-word first, is what lets one
+    # vendor value land on whichever name the loaded model publishes.
+    "clustering": (("clustering", "separation"), None),
+    # Cohere pairs this with `images`, so the modality already says what the
+    # input is and there is no retrieval role to carry.
+    "image": ((), None),
+}
+
+# Gemini `taskType`, all nine published values.
+TASK_TYPE_ROLES = {
+    "TASK_TYPE_UNSPECIFIED": ((), None),
+    "RETRIEVAL_QUERY": (("retrieval",), QUERY),
+    "RETRIEVAL_DOCUMENT": (("retrieval",), PASSAGE),
+    "SEMANTIC_SIMILARITY": (("text-matching",), None),
+    "CLASSIFICATION": (("classification",), None),
+    "CLUSTERING": (("clustering", "separation"), None),
+    "QUESTION_ANSWERING": (("qa", "retrieval"), QUERY),
+    "FACT_VERIFICATION": (("retrieval",), QUERY),
+    "CODE_RETRIEVAL_QUERY": (("nl2code", "code", "retrieval"), QUERY),
+}

@@ -14,11 +14,17 @@ import numpy as np
 import torch
 
 import serialize
+import tasks
 import telemetry
 from batching import Batcher, autotune_budget
 from catalog import spec_for
 from config import settings
-from errors import BadRequest, ModelNotLoaded, PayloadTooLarge
+from errors import (
+    BadRequest,
+    ModelNotLoaded,
+    PayloadTooLarge,
+    UnprocessableEntity,
+)
 from families import Family, family_for
 from families.reranking import document_text
 
@@ -212,12 +218,203 @@ def count_tokens(texts: list[str], cap: Optional[int] = None) -> int:
     return sum(token_lengths(texts, cap))
 
 
+def _check_task(task: Optional[str]) -> None:
+    """Reject a task the public API rejects, so a typo cannot silently select a
+    different LoRA adapter.
+
+    The vocabulary is ``SPEC.task_enum``, matched whole. Matching the base name
+    instead let through a whole family of values the public API refuses, and
+    two of them were not merely permissive:
+
+    - bare ``retrieval``, on every model whose enum lists only
+      ``retrieval.query`` and ``retrieval.passage``;
+    - suffixed forms like ``classification.query``, whose base is known but
+      whose full name no family recognises -- on v3 those reached the
+      translation table, missed, and came back as ``retrieval.passage``
+      vectors with a 200 on them.
+
+    An empty enum means the public API declares no ``task`` field for this
+    model at all, so there is nothing here to contradict: the value is passed
+    through and the model ignores it, which is what api.jina.ai does too.
+    """
+    if not task or not SPEC.task_enum or task in SPEC.task_enum:
+        return
+    raise BadRequest(
+        f"Unknown task '{task}' for {settings.short_model_id}. "
+        f"This model accepts: {', '.join(SPEC.task_enum)}.",
+        field="task",
+    )
+
+
+def fit_task(
+    candidates: tuple, role: Optional[str], *, field: str, value: str
+) -> Optional[str]:
+    """Turn another vendor's ``(preferred families, role)`` into a task THIS
+    model has -- or refuse, when there is nothing honest to turn it into.
+
+    A vendor's ``input_type`` / ``taskType`` is a closed single-choice list.
+    ``search_query`` is the *only* thing a Cohere client can say for a query,
+    and code-embeddings has no ``retrieval`` task, so refusing that pair would
+    reject every request that client is capable of making. The role is the
+    analogy that survives: a query is still a query, so it lands on the
+    model's own default family as ``nl2code.query``.
+
+    ``classification`` is the other case, and it must not be treated the same
+    way. Code-embeddings has no classification task and no role to fall back
+    on, so there is no reading of the request this model can answer -- and
+    ``task=classification`` is already a 400 on the native route. Returning
+    ``nl2code`` vectors instead would be the exact defect this rewrite exists
+    to remove, in a new place: a wrong answer with a 200 on it.
+
+    Returning ``None`` means "no task", which is a real answer for three cases:
+    the vendor's own "unspecified" value, a model that publishes no vocabulary
+    at all, and a model that has the concept but names no form of it for this
+    role -- see the clip-v2 note below.
+
+    The answer is picked out of ``SPEC.task_enum`` rather than assembled from
+    base names, because the enum is the only thing that knows which forms
+    exist. v3 is the case that forces it: it has a clustering adapter and calls
+    it ``separation``, so a Cohere ``clustering`` must skip the word it shares
+    and land on the word this model actually takes.
+    """
+    family = _require_embed()
+    allowed = SPEC.task_enum
+    if not allowed:
+        return _fit_without_enum(family, candidates, role)
+
+    for name in candidates:
+        if role and f"{name}.{role}" in allowed:
+            return f"{name}.{role}"
+        if name in allowed:
+            return name
+
+    # The model has the concept and names no form of it for this role. clip-v2
+    # is the whole of this case: its enum is `retrieval.query` alone, because
+    # only the query side carries a prefix -- `config_sentence_transformers`
+    # has that one prompt and a null default. Its document side is therefore
+    # the unprefixed encoding, reached by sending no task, which is a real
+    # value of the native field. Refusing instead would leave a Cohere client
+    # unable to index against this model at all: `input_type` is required
+    # there, with no neutral member, so `search_document` is the only thing it
+    # can say for a document.
+    bases = {name.partition(".")[0] for name in allowed}
+    if any(name in bases for name in candidates):
+        return None
+    if not candidates:
+        return None
+    if role:
+        fallback = f"{tasks.default_task(SPEC.family).partition('.')[0]}.{role}"
+        if fallback in allowed:
+            return fallback
+    raise BadRequest(
+        f"'{value}' has no counterpart in {settings.short_model_id}, which "
+        f"serves: {', '.join(allowed)}. Nothing in the request says whether "
+        f"the text is a query or a document either, so there is no reading of "
+        f"it this model can answer.",
+        field=field,
+    )
+
+
+def _fit_without_enum(
+    family: Family, candidates: tuple, role: Optional[str]
+) -> Optional[str]:
+    """``fit_task`` for a model the public API declares no ``task`` field on.
+
+    Nothing to match against and nothing to refuse: the v2 family and clip-v1
+    take any task and ignore it, so the only question left is whether a role
+    survives the translation.
+    """
+    known = family.known_tasks
+    base = next((name for name in candidates if name in known), None)
+    if base is not None:
+        return f"{base}.{role}" if role else base
+    if role and candidates:
+        return f"{tasks.default_task(SPEC.family).partition('.')[0]}.{role}"
+    return None
+
+
+def named_task(name: str, *, field: str, vendor_values) -> str:
+    """Accept a task named outright in a vendor's field.
+
+    Cohere has no word for ``nl2code.query`` and never will, so a caller who
+    knows this image is a Jina model has no way to ask for it through Cohere's
+    envelope. The envelope should not be what stops them: the field is
+    Cohere's, the vocabulary can be ours. It is the same move as writing
+    "jiaozi" in English rather than pretending it is a dumpling.
+
+    Only names this model actually serves; anything else is still a typo. A
+    model that declares no vocabulary at all serves none of them and
+    contradicts none of them either -- ``/v1/embeddings`` takes any task name
+    on those images and the model ignores it, which is also what the public
+    API does. Refusing here would have made the envelope decide the answer,
+    which is the one thing it must never do.
+    """
+    _require_embed()
+    allowed = SPEC.task_enum
+    if not allowed or name in allowed:
+        return name
+    raise BadRequest(
+        f"Unknown {field} '{name}'. Accepted: "
+        f"{', '.join(sorted(vendor_values))}, or a task "
+        f"{settings.short_model_id} serves ({', '.join(allowed)}).",
+        field=field,
+    )
+
+
+def _check_dimensions(dimensions: Optional[int]) -> None:
+    """The public API caps `dimensions` at the model's own output dimension and
+    422s above it; without the check a too-large value silently no-ops."""
+    limit = SPEC.output_dim
+    if dimensions and limit and dimensions > limit:
+        raise UnprocessableEntity(
+            f"Input should be less than or equal to {limit}",
+            field="body -> dimensions",
+            code="less_than_equal",
+        )
+
+
+def _check_extras(family: Family, extra: Optional[dict]) -> Optional[dict]:
+    """sentence-transformers drops undeclared encode kwargs silently, so a
+    `late_chunking` request against a model without it would return ordinary
+    embeddings and look like a success."""
+    if not extra:
+        return extra
+    accepted = family.encode_kwargs
+    for name in extra:
+        if name not in accepted:
+            raise BadRequest(
+                f"'{name}' is not supported by {settings.short_model_id}.",
+                field=name,
+            )
+    return extra
+
+
+def _refuse_over_length(lengths: list) -> None:
+    """`truncate=false` means "error rather than silently shorten". Measured on
+    api.jina.ai: over-length input returns HTTP 400 `INPUT_TOKEN_LIMIT_EXCEEDED`,
+    and only `truncate=true` succeeds. Left to sentence-transformers the input
+    would be clipped with nothing on the wire to say so, which changes the
+    embedding invisibly."""
+    limit = SPEC.context
+    if not limit:
+        return
+    if any(length > limit for length in lengths):
+        raise BadRequest(
+            f"Input text exceeds the model's maximum of {limit} tokens. "
+            f"Use 'truncate: true' to automatically truncate, or split "
+            f"into smaller chunks.",
+            field="input",
+            code="INPUT_TOKEN_LIMIT_EXCEEDED",
+        )
+
+
 def embed(
     items: list,
     task: Optional[str] = None,
     dimensions: Optional[int] = None,
     normalized: bool = True,
     extra: Optional[dict] = None,
+    truncate: bool = True,
 ) -> tuple[np.ndarray, int, float]:
     """Embed text, media, and fused multimodal blocks in one call.
 
@@ -226,16 +423,34 @@ def embed(
 
     ``extra`` carries the native parameters that change the forward pass
     (``late_chunking``, ``return_multivector``, ``return_tokenized_input``).
-    The route has already checked them against ``family.encode_kwargs``, so
-    anything arriving here is a kwarg the model genuinely consumes.
+
+    The contract checks live here rather than in an adapter. They used to sit
+    in ``adapters/jina.py``, which made the Jina route the only one that
+    enforced them: the same over-limit ``dimensions`` was a 422 through
+    ``/v1/embeddings`` and a silent full-width 200 through Cohere's, because
+    ``_truncate`` no-ops when the request is wider than the model. An adapter
+    can only be trusted to translate its own dialect; what a request is allowed
+    to *say* is the model's business, and this is where the model is.
     """
     family = _require_embed()
+    _check_task(task)
+    _check_dimensions(dimensions)
+    extra = _check_extras(family, extra)
     task, prompt_name = family.resolve_task(task)
     inputs, texts, per_row = _split_inputs(items)
-    # One tokenizer pass, used twice: for the usage figure and for the packing
-    # weights. It runs on a threadpool thread, so a second pass over the same
-    # text competes with the model worker for the CPU it needs to feed the GPU.
-    lengths = token_lengths(texts, cap=SPEC.context) if texts else []
+    # One tokenizer pass, used three times: to refuse over-length input, for
+    # the usage figure, and for the packing weights. It runs on a threadpool
+    # thread, so a second pass over the same text competes with the model
+    # worker for the CPU it needs to feed the GPU -- which is what the old
+    # per-item `count_tokens` call in the route was doing.
+    raw_lengths = token_lengths(texts) if texts else []
+    if not truncate:
+        _refuse_over_length(raw_lengths)
+    lengths = (
+        [min(length, SPEC.context) for length in raw_lengths]
+        if SPEC.context
+        else raw_lengths
+    )
     n_tokens = sum(lengths) if texts else len(items)
 
     start = time.perf_counter()
@@ -374,7 +589,9 @@ def rerank(
     documents: list,
     top_n: Optional[int] = None,
     return_documents: bool = True,
+    return_embeddings: bool = False,
     max_doc_length: Optional[int] = None,
+    truncate: bool = True,
 ) -> tuple[list[dict], int, float]:
     """Score ``documents`` against ``query``.
 
@@ -383,16 +600,34 @@ def rerank(
     text: truncation is a scoring directive, and round-tripping a detokenised
     fragment back to the client would corrupt it -- lower-cased, respaced, or
     with CJK split at subword boundaries.
+
+    ``truncate`` is Voyage's ``truncation``, and false means raise rather than
+    trim. Silently scoring the first N tokens of a document the caller believes
+    was read in full is exactly what they turned it off to avoid.
+
+    ``return_embeddings`` is refused rather than ignored on a model that has no
+    document vector. Accepting it and answering without one would be a 200 that
+    is missing the thing the caller asked for, with nothing in the response to
+    say so.
     """
     family = _require_rerank()
+    if return_embeddings and not family.embeds_documents:
+        raise BadRequest(
+            f"{settings.short_model_id} scores each query-document pair "
+            "directly and never forms a document vector, so there is no "
+            "embedding for it to return.",
+            field="return_embeddings",
+        )
     texts = [document_text(document) for document in documents]
     if max_doc_length:
         texts = [_clip(text, max_doc_length) for text in texts]
+    if not truncate:
+        _refuse_over_length(token_lengths([query] + texts))
     n_tokens = count_tokens([query] + texts, cap=SPEC.context)
 
     start = time.perf_counter()
     with _MODEL_LOCK, torch.inference_mode():
-        ranked = family.rank(query, texts, top_n)
+        ranked = family.rank(query, texts, top_n, return_embeddings=return_embeddings)
     elapsed = time.perf_counter() - start
 
     telemetry.record(n_tokens, elapsed)
@@ -402,12 +637,17 @@ def rerank(
     )
 
     results = []
-    for index, score in ranked:
-        # `document` is omitted, never null, when return_documents is false --
-        # measured on api.jina.ai for every reranker.
-        result = {"index": index, "relevance_score": serialize.relevance_score(score)}
+    for item in ranked:
+        # `document` and `embedding` are omitted, never null, when not asked
+        # for -- measured on api.jina.ai for every reranker.
+        result = {
+            "index": item.index,
+            "relevance_score": serialize.relevance_score(item.score),
+        }
         if return_documents:
-            result["document"] = family.render_document(documents[index])
+            result["document"] = family.render_document(documents[item.index])
+        if item.embedding is not None:
+            result["embedding"] = item.embedding
         results.append(result)
     return results, n_tokens, elapsed
 

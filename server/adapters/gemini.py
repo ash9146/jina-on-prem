@@ -19,23 +19,13 @@ from fastapi import APIRouter
 from pydantic import BaseModel, ConfigDict
 
 import engine
-from errors import JinaError, request_id
+import tasks
+from errors import BadRequest, JinaError, request_id
 from media import _parse_content_part as parse_content_part
 
 from .jina import reject_foreign_model
 
 router = APIRouter(tags=["Google Gemini"])
-
-TASK_TYPES = {
-    "RETRIEVAL_QUERY": "retrieval.query",
-    "RETRIEVAL_DOCUMENT": "retrieval.passage",
-    "SEMANTIC_SIMILARITY": "text-matching",
-    "CLASSIFICATION": "classification",
-    "CLUSTERING": "clustering",
-    "QUESTION_ANSWERING": "retrieval.query",
-    "FACT_VERIFICATION": "retrieval.query",
-    "CODE_RETRIEVAL_QUERY": "retrieval.query",
-}
 
 # Canonical gRPC status names, keyed by HTTP status (google.aip.dev/193).
 STATUS_NAMES = {
@@ -94,8 +84,9 @@ def embed_content(model_id: str, request: EmbedContentRequest):
 
     vectors, n_tokens, _ = engine.embed(
         [item],
-        task=TASK_TYPES.get(config.get("taskType") or "", "retrieval"),
+        task=_task_of(config),
         dimensions=config.get("outputDimensionality"),
+        truncate=_truncate_of(config),
     )
     return {
         "embedding": {"values": vectors[0].tolist()},
@@ -111,19 +102,78 @@ def batch_embed_contents(model_id: str, request: BatchEmbedRequest):
     for sub in request.requests:
         reject_foreign_model(sub.get("model"))
 
-    items, dimensions, task_type = [], None, ""
-    for sub in request.requests:
-        dimensions = dimensions or _config_of(sub).get("outputDimensionality")
-        task_type = task_type or _config_of(sub).get("taskType") or ""
-        items.append(content_item(sub.get("content", {})))
+    # `taskType` and `outputDimensionality` are per sub-request, which is the
+    # only reason the field lives there rather than on the batch. Collapsing
+    # them onto the first non-empty value -- what this did -- encoded an
+    # index-building batch of one query and one passage entirely as queries,
+    # and returned 200. Sub-requests are grouped by the pair instead, so each
+    # row gets the encoding it asked for; rows sharing a pair still share one
+    # forward, so the common case costs no extra call.
+    groups: dict = {}
+    for position, sub in enumerate(request.requests):
+        config = _config_of(sub)
+        key = (
+            _task_of(config),
+            config.get("outputDimensionality"),
+            _truncate_of(config),
+        )
+        groups.setdefault(key, []).append(
+            (position, content_item(sub.get("content", {})))
+        )
 
-    vectors, n_tokens, _ = engine.embed(
-        items, task=TASK_TYPES.get(task_type, "retrieval"), dimensions=dimensions
-    )
+    ordered: list = [None] * len(request.requests)
+    n_tokens = 0
+    for (task, dimensions, truncate), entries in groups.items():
+        vectors, tokens, _ = engine.embed(
+            [item for _, item in entries],
+            task=task,
+            dimensions=dimensions,
+            truncate=truncate,
+        )
+        n_tokens += tokens
+        for (position, _), vector in zip(entries, vectors):
+            ordered[position] = vector
+
     return {
-        "embeddings": [{"values": vector.tolist()} for vector in vectors],
+        "embeddings": [{"values": vector.tolist()} for vector in ordered],
         "usageMetadata": {"promptTokenCount": n_tokens, "promptTokenDetails": []},
     }
+
+
+def _task_of(config: dict) -> Optional[str]:
+    """Gemini's `taskType`, as a task this model has.
+
+    Substituting a default for an unrecognised task type answered a typo with
+    retrieval vectors and a 200; refusing everything outside Gemini's enum then
+    rejected the tasks this model actually serves, which Gemini has no value
+    for. Both of Gemini's nine and this model's own names are answered; a typo
+    is neither.
+
+    An absent `taskType` no longer forces ``retrieval`` either. Gemini treats
+    it as unspecified, and unspecified is each model's own default -- the same
+    answer `/v1/embeddings` gives when `task` is omitted, which is the point of
+    serving both schemas from one core.
+    """
+    task_type = config.get("taskType")
+    if not task_type:
+        return None
+    roles = tasks.TASK_TYPE_ROLES.get(task_type)
+    if roles is not None:
+        return engine.fit_task(*roles, field="taskType", value=task_type)
+    return engine.named_task(
+        task_type, field="taskType", vendor_values=tasks.TASK_TYPE_ROLES
+    )
+
+
+def _truncate_of(config: dict) -> bool:
+    """`embedContentConfig.autoTruncate`, which was read and then dropped.
+
+    Only an explicit false changes anything: absent means the caller expressed
+    no opinion, and this route has always trimmed in that case. False is a
+    request to be told, and answering it with a quietly shortened embedding is
+    the failure it exists to prevent.
+    """
+    return config.get("autoTruncate") is not False
 
 
 def _config_of(sub: dict) -> dict:

@@ -155,6 +155,14 @@ class SentenceTransformerFamily(Family):
 
 
 class EmbeddingsV3Family(SentenceTransformerFamily):
+    @property
+    def known_tasks(self) -> frozenset[str]:
+        # The catalog's published enum, reduced to base names. Reading v3's
+        # prompts instead gets most of it and misses whichever entries have no
+        # prompt of their own, which is how the vocabulary drifted from the
+        # public API's in the first place.
+        return frozenset(name.partition(".")[0] for name in self.spec.task_enum)
+
     def resolve_task(self, task: Optional[str]) -> tuple[Optional[str], Optional[str]]:
         # v3 no-task: prod runs the raw base xlm-roberta with no LoRA and no
         # prefix when ``task`` is omitted (verified against api.jina.ai --
@@ -164,13 +172,14 @@ class EmbeddingsV3Family(SentenceTransformerFamily):
         # the "Represent the document..." prefix.
         if not task:
             return None, None
-        # Resolve the prompt against the MAPPED task, because v3's prompts are
-        # keyed by task name. Without this the suffix-less ``retrieval`` alias
-        # skips the prompt lookup and encodes without v3's required
-        # "Represent the document for retrieval: " prefix -- previously observed
-        # as cos~0.92 vs prod for retrieval.passage.
-        mapped = tasks.V3_TASKS.get(task, "retrieval.passage")
-        return mapped, tasks.map_prompt_name(mapped, self.prompts)
+        # Straight through: v3's prompts are keyed by task name and the task is
+        # already one of the enum's own strings, so the lookup in
+        # ``map_prompt_name`` hits directly. The table this used to go through
+        # existed to expand a suffix-less ``retrieval`` alias the public API
+        # does not accept, and it defaulted anything it did not recognise to
+        # ``retrieval.passage`` -- which is how ``clustering`` and
+        # ``classification.query`` came back as retrieval vectors with a 200.
+        return task, tasks.map_prompt_name(task, self.prompts)
 
 
 class EmbeddingsV4Family(SentenceTransformerFamily):
@@ -184,6 +193,16 @@ class EmbeddingsV4Family(SentenceTransformerFamily):
 
 
 class EmbeddingsV5Family(SentenceTransformerFamily):
+    @property
+    def known_tasks(self) -> frozenset[str]:
+        # v5 keeps the model behind a custom module, so the generic reader
+        # finds no task_names and no task-keyed prompts. The vocabulary is not
+        # actually unknown -- the model's own validator prints it: "Must be one
+        # of ['retrieval', 'text-matching', 'clustering', 'classification']".
+        # Stating it here is what lets a Cohere or Gemini request be fitted to
+        # this model instead of falling back as if it had no tasks at all.
+        return frozenset(name.partition(".")[0] for name in tasks.V5_TASKS)
+
     def resolve_task(self, task: Optional[str]) -> tuple[Optional[str], Optional[str]]:
         # v5 (text and omni): the custom encode only accepts the bare base task.
         # For omni the .query/.passage suffix is forwarded via prompt_name;
