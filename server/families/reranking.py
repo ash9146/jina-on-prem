@@ -32,15 +32,16 @@ class RerankFamily(Family):
         """
 
     def render_document(self, document: Any) -> Any:
-        """The shape of ``results[].document``.
+        """The shape of ``results[].document``: echo what the caller sent.
 
-        Measured on api.jina.ai the rule is per-family: the CrossEncoder family
-        (v1 / v2 / m0) echoes whatever type the caller sent, while JinaForRanking
-        (v3 / v3.5) always wraps in ``{"text": ...}``. On-prem wraps for
-        everyone, which is right for v3/v3.5 and wrong for the rest; splitting
-        the two is a wire change and lands with the envelope work.
+        Measured on api.jina.ai, this is per-family and not a global rule. The
+        CrossEncoder family mirrors the caller's type -- a bare string in gives
+        a bare string out, ``{"text": ...}`` in gives an object out -- so the
+        base class echoes and ``JinaRankingFamily`` overrides. ColBERT has no
+        public rerank oracle (the public API also lists it under embeddings) and
+        is treated as CrossEncoder-family by analogy.
         """
-        return {"text": document_text(document)}
+        return document
 
 
 class CrossEncoderFamily(RerankFamily):
@@ -91,20 +92,37 @@ class JinaRankingFamily(RerankFamily):
     per-item truncation baked into its own rerank().
     """
 
+    def render_document(self, document: Any) -> Any:
+        """Always an object, whatever the caller sent -- measured on
+        api.jina.ai for both v3 and v3.5, with string and object input."""
+        return {"text": document_text(document)}
+
     def _load(self) -> None:
         from transformers import AutoModel
 
         # Native dtype is bf16; keep it on cuda, use fp32 on cpu because generic
         # x86_64 has no bf16 SIMD.
         dtype = torch.bfloat16 if settings.device == "cuda" else torch.float32
+        # Pinned, not left to the transformers default: eager attention holds the
+        # whole (heads, N, N) score matrix, which at this model's 16 heads is
+        # 34 GB for a 32k-token block and 137 GB for a 64k one -- and listwise
+        # reranking packs documents until the block fills. sdpa never
+        # materialises it. The default resolves to sdpa today, but "today"
+        # spans transformers 4.44 to 5.7 across this catalogue, and a silent
+        # fallback would surface as an unexplained OOM rather than a config
+        # mistake. Logged below for the same reason.
         model = AutoModel.from_pretrained(
             self.spec.hf_repo,
             trust_remote_code=True,
             torch_dtype=dtype,
             low_cpu_mem_usage=True,
+            attn_implementation="sdpa",
         )
         self.model = model.to(settings.device).eval()
-        logger.info(f"Loaded as JinaForRanking: {self.spec.hf_repo} dtype={dtype}")
+        attn = getattr(model.config, "_attn_implementation", "unknown")
+        logger.info(
+            f"Loaded as JinaForRanking: {self.spec.hf_repo} dtype={dtype} attn={attn}"
+        )
 
     def rank(
         self, query: str, documents: list[str], top_n: Optional[int]
