@@ -3,7 +3,9 @@
 Routes call in here; ``families`` decides what actually happens per model.
 """
 
+import itertools
 import logging
+import threading
 import time
 from contextlib import nullcontext
 from typing import Any, Optional
@@ -13,9 +15,10 @@ import torch
 
 import serialize
 import telemetry
+from batching import Batcher, autotune_budget
 from catalog import spec_for
 from config import settings
-from errors import BadRequest, ModelNotLoaded
+from errors import BadRequest, ModelNotLoaded, PayloadTooLarge
 from families import Family, family_for
 from families.reranking import document_text
 
@@ -37,18 +40,83 @@ MULTIMODAL_MODEL_IDS = {
 }
 
 _family: Optional[Family] = None
+_batcher: Optional[Batcher] = None
+_solo = itertools.count()
+
+# One thread in the model at a time. The routes are synchronous handlers, so
+# Starlette dispatches them to its threadpool and several can arrive at once --
+# and none of these models is thread-safe. Without this, two concurrent
+# requests to a compiled CUDA model corrupt each other's state and surface as
+# `index out of bounds` from inside an Inductor kernel, which reads like a bad
+# input rather than a race.
+#
+# It does not make anything slower than it was: a single GPU runs one forward
+# at a time regardless, and before the handlers were synchronous the event loop
+# was serialising them anyway. What changed is that the serialisation now
+# happens here instead of in the event loop, so /health still answers while a
+# forward is running.
+_MODEL_LOCK = threading.Lock()
 
 
 def load() -> None:
-    global _family
+    global _family, _batcher
     logger.info(f"Loading model: {settings.model_id}")
     family = family_for(SPEC)
     family.load()
     _family = family
+    if family.verb == "embed":
+        # Always, not only when batching is on. The worker exists first to keep
+        # a single thread on the model -- Starlette dispatches the synchronous
+        # handlers to a pool, and neither these models nor torch's CUDA-graph
+        # cache tolerate two threads. `merge` is what the throughput variant
+        # turns on; with it off the worker runs exactly one job per forward and
+        # the vectors are bit-identical to calling encode inline.
+        _batcher = Batcher(
+            encode=lambda key, inputs, merge: _encode(
+                family, key, inputs, len(inputs) if merge else None
+            ),
+            wait_ms=settings.batch_wait_ms,
+            merge=settings.batching,
+            startup=(lambda: _initial_budget(family)) if settings.batching else None,
+        )
     logger.info(
         f"Model loaded: {settings.model_id} on {settings.device} | "
-        f"multimodal={is_multimodal()} | threads={settings.cpu_threads}"
+        f"multimodal={is_multimodal()} | threads={settings.cpu_threads} | "
+        # Every embed image has the worker; only the throughput variant merges
+        # across requests. Reporting the worker's existence as "batching" made
+        # a plain :gpu image claim it was batching when it was not.
+        f"worker={_batcher is not None} | batching={settings.batching}"
     )
+
+
+def _initial_budget(family: Family) -> int:
+    if settings.batch_tokens > 0:
+        logger.info(f"Token budget fixed by JINA_BATCH_TOKENS: {settings.batch_tokens}")
+        return settings.batch_tokens
+    try:
+        task, prompt_name = family.resolve_task(None)
+        # ~512 tokens of ordinary prose. A synthetic repeat is fine here: the
+        # probe is measuring how much VRAM a shape costs, not what it means.
+        sample = "semantic search over a document collection " * 64
+
+        def probe(rows: int) -> None:
+            # batch_size must match the row count or sentence-transformers
+            # chunks the probe at 32 and the measurement is of 32 rows however
+            # many were asked for -- which reads as "memory does not grow".
+            with torch.inference_mode(), family.autocast():
+                family.encode(
+                    [sample] * rows,
+                    task,
+                    prompt_name,
+                    normalized=True,
+                    extra=None,
+                    batch_size=rows,
+                )
+
+        return autotune_budget(probe, SPEC.context)
+    except Exception as exc:  # noqa: BLE001 - a failed probe must not block startup
+        logger.warning(f"Token-budget autotune failed ({type(exc).__name__}: {exc}); using 8192")
+        return 8192
 
 
 def is_ready() -> bool:
@@ -116,7 +184,7 @@ def tokenizer():
     return _family.tokenizer if _family else None
 
 
-def count_tokens(texts: list[str], cap: Optional[int] = None) -> int:
+def token_lengths(texts: list[str], cap: Optional[int] = None) -> list[int]:
     """Tokens the model will actually process.
 
     ``cap`` is the per-input context limit. It matters for ``truncate=true``:
@@ -137,7 +205,11 @@ def count_tokens(texts: list[str], cap: Optional[int] = None) -> int:
         lengths = [len(text.split()) for text in texts]
     if cap:
         lengths = [min(length, cap) for length in lengths]
-    return sum(lengths)
+    return lengths
+
+
+def count_tokens(texts: list[str], cap: Optional[int] = None) -> int:
+    return sum(token_lengths(texts, cap))
 
 
 def embed(
@@ -159,21 +231,42 @@ def embed(
     """
     family = _require_embed()
     task, prompt_name = family.resolve_task(task)
-    inputs, texts = _split_inputs(items)
-    n_tokens = count_tokens(texts, cap=SPEC.context) if texts else len(items)
+    inputs, texts, per_row = _split_inputs(items)
+    # One tokenizer pass, used twice: for the usage figure and for the packing
+    # weights. It runs on a threadpool thread, so a second pass over the same
+    # text competes with the model worker for the CPU it needs to feed the GPU.
+    lengths = token_lengths(texts, cap=SPEC.context) if texts else []
+    n_tokens = sum(lengths) if texts else len(items)
 
     start = time.perf_counter()
     try:
-        with torch.inference_mode(), family.autocast():
-            embeddings = family.encode(
-                inputs, task, prompt_name, normalized=normalized, extra=extra
-            )
+        embeddings = _dispatch(
+            family,
+            inputs,
+            _row_lengths(inputs, lengths, per_row),
+            task,
+            prompt_name,
+            normalized,
+            extra,
+        )
     except ValueError as exc:
         # The model is the authority on its own task names, and some -- v4,
         # v5 -- expose none to check against beforehand. When one rejects an
         # argument it is the caller's mistake, so it answers 400 carrying the
         # model's own message rather than a 500 that reads like a crash.
         raise BadRequest(str(exc), field="task") from exc
+    except torch.OutOfMemoryError as exc:
+        # Reached only after the batcher has already halved the batch down to a
+        # single row, so the input itself does not fit -- retrying or sending
+        # less of it is the caller's only remedy, and "Internal Server Error"
+        # tells them neither. Attention over N tokens costs O(N^2) on the
+        # models that materialise a score matrix, so a max-context input can
+        # exceed a 23 GB card on its own.
+        raise PayloadTooLarge(
+            f"Input too large for '{settings.short_model_id}' on this hardware: "
+            f"{n_tokens} tokens exhausted GPU memory. Send fewer tokens per "
+            f"input, or set 'dimensions'/'truncate' to reduce the work."
+        ) from exc
     elapsed = time.perf_counter() - start
 
     if isinstance(embeddings, np.ndarray) and embeddings.ndim == 1 and len(items) == 1:
@@ -190,6 +283,70 @@ def embed(
         embeddings = _truncate(embeddings, dimensions, normalized)
 
     return embeddings, n_tokens, tok_per_s
+
+
+def _encode(family: Family, key: tuple, inputs: list, batch_size: Optional[int] = None):
+    """One forward. The only place ``family.encode`` is called."""
+    task, prompt_name, normalized, extra_items, _ = key
+    with _MODEL_LOCK, torch.inference_mode(), family.autocast():
+        return family.encode(
+            inputs,
+            task,
+            prompt_name,
+            normalized=normalized,
+            extra=dict(extra_items) or None,
+            batch_size=batch_size,
+        )
+
+
+def _dispatch(family: Family, inputs, row_lengths, task, prompt_name, normalized, extra):
+    """Encode directly, or hand the rows to the batcher and wait for them.
+
+    Both paths reach the same ``family.encode``; batching only changes which
+    rows share a forward. Everything that would change the *result* -- task,
+    prompt prefix, normalisation, the native extras -- is in the grouping key,
+    so a merged batch computes exactly what the rows would have computed alone.
+
+    Anything that is not plain text gets a key nothing else can share. Media
+    has no token length to sort by and its cost per row is unrelated to text's,
+    so it is served alone -- still on the worker thread, because the invariant
+    that matters is one thread on the model, not that every batch is full.
+    """
+    extra_items = tuple(sorted((extra or {}).items()))
+    key = (task, prompt_name, normalized, extra_items, None)
+    if _batcher is None:
+        return _encode(family, key, inputs)
+    if _batcher.merges and not all(isinstance(item, str) for item in inputs):
+        key = (task, prompt_name, normalized, extra_items, next(_solo))
+    rows = _batcher.submit(inputs, key, row_lengths)
+    return _restack(rows)
+
+
+def _row_lengths(inputs: list, lengths: list[int], per_row: list[int]) -> list[int]:
+    """Packing weight per row, read off the tokenizer pass ``embed`` made.
+
+    A non-text row is charged the full context so packing never puts it in a
+    chunk it would blow up; it is alone in its group anyway.
+    """
+    weights, cursor = [], 0
+    for item, parts in zip(inputs, per_row):
+        weights.append(
+            lengths[cursor] if isinstance(item, str) else (SPEC.context or 512)
+        )
+        cursor += parts
+    return weights
+
+
+def _restack(rows: list):
+    """Undo the per-row split so both paths return the same shape.
+
+    Plain embeddings come back as an ``(n, dim)`` matrix; ``late_chunking`` and
+    ``return_multivector`` come back as a list of per-token matrices, which
+    ``_truncate`` and the serializer both already expect to stay a list.
+    """
+    if rows and all(isinstance(row, np.ndarray) and row.ndim == 1 for row in rows):
+        return np.stack(rows)
+    return rows
 
 
 def _truncate(embeddings, dimensions: int, normalized: bool):
@@ -234,7 +391,7 @@ def rerank(
     n_tokens = count_tokens([query] + texts, cap=SPEC.context)
 
     start = time.perf_counter()
-    with torch.inference_mode():
+    with _MODEL_LOCK, torch.inference_mode():
         ranked = family.rank(query, texts, top_n)
     elapsed = time.perf_counter() - start
 
@@ -308,7 +465,7 @@ def generate(
         if settings.device == "cuda" and dtype != torch.float32
         else nullcontext()
     )
-    with torch.inference_mode(), autocast:
+    with _MODEL_LOCK, torch.inference_mode(), autocast:
         output = family.model.generate(
             **inputs,
             generation_config=generation_config,
@@ -330,9 +487,15 @@ def generate(
     return text, prompt_tokens, completion_tokens
 
 
-def _split_inputs(items: list) -> tuple[list, list[str]]:
-    """Return (encode inputs, the text parts that token counting sees)."""
-    inputs, texts = [], []
+def _split_inputs(items: list) -> tuple[list, list[str], list[int]]:
+    """Return (encode inputs, the text parts token counting sees, and how many
+    of those parts each row contributed).
+
+    The last one exists so the caller can redistribute one batched tokenizer
+    pass back over the rows: a fused block contributes several texts, bare
+    media none, so the two lists do not line up index for index.
+    """
+    inputs, texts, per_row = [], [], []
     for item in items:
         if isinstance(item, list):
             # Put non-text parts first in the tuple. The model's
@@ -340,16 +503,20 @@ def _split_inputs(items: list) -> tuple[list, list[str]]:
             # shortcut; non-text-first forces _encode_composite_parts, which
             # handles every ordering correctly.
             inputs.append(tuple(sorted(item, key=lambda part: isinstance(part, str))))
-            texts.extend(part for part in item if isinstance(part, str))
+            parts = [part for part in item if isinstance(part, str)]
+            texts.extend(parts)
+            per_row.append(len(parts))
         elif isinstance(item, str):
             inputs.append(item)
             texts.append(item)
+            per_row.append(1)
         else:
             # ST 3.4.1's _text_length() raises on PIL/BytesIO inside a tuple, so
             # standalone media goes in bare and ST routes it through custom_st's
             # _encode_single_image, which handles pure-image input correctly.
             inputs.append(item)
-    return inputs, texts
+            per_row.append(0)
+    return inputs, texts, per_row
 
 
 def _to_device(inputs: Any, dtype: torch.dtype) -> dict:

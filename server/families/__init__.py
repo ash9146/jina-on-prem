@@ -83,7 +83,10 @@ class Family(ABC):
         off the underlying HF config.
 
         Empty means the model exposes nothing to check against, and the task is
-        passed through rather than guessed at.
+        passed through rather than guessed at. v5 is that case -- its module
+        keeps the model somewhere this cannot see -- so its vocabulary is
+        enforced by the model's own validator instead, which is why
+        ``tasks.v5_task`` must hand an unknown task through untouched.
         """
         names = {
             str(name)

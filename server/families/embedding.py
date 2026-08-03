@@ -68,14 +68,26 @@ class SentenceTransformerFamily(Family):
         *,
         normalized: bool = True,
         extra: Optional[dict] = None,
+        batch_size: Optional[int] = None,
     ):
         """Prompt routing applies whenever the model exposes a matching prompts
         entry: v5-omni "Query: "/"Document: " (without it, last-token pooling on
         the LLaMA/Qwen text tower drifts -- cos ~0.16 on nano); v4
         "Query: "/"Passage: " on the retrieval/code LoRAs; code-embeddings
         "Find the most relevant ..."/"Candidate ..." per task family.
+
+        ``batch_size`` comes from the batcher and from nothing else. Left unset,
+        sentence-transformers re-chunks whatever it is given at its own default
+        of 32, which silently undoes the batcher's token-budget packing -- a
+        400-row forward becomes thirteen 32-row forwards and the GPU sees the
+        same small shapes it saw before. It stays unset on the unbatched path
+        on purpose: batch size perturbs floating-point reduction order, so
+        forcing it there would change the vectors the shipped :cpu / :gpu
+        images return today.
         """
         kwargs = {"convert_to_numpy": True, "normalize_embeddings": normalized}
+        if batch_size:
+            kwargs["batch_size"] = batch_size
         kwargs.update(self._task_kwargs(task))
         kwargs.update(extra or {})
         if kwargs.get("return_multivector"):
@@ -108,6 +120,14 @@ class SentenceTransformerFamily(Family):
         else:
             logger.info(f"Running in FP32 (JINA_DTYPE={settings.dtype})")
 
+        # CUDA Graphs are captured per shape, and a token-budget batcher emits a
+        # different shape on almost every forward -- it would recapture
+        # continuously, paying a capture cost to avoid a launch cost that
+        # batching has already amortised. (Thread affinity is handled elsewhere:
+        # every forward, warm-up included, runs on the model worker.)
+        if settings.batching:
+            logger.info("torch.compile skipped: shapes vary per forward when batching")
+            return
         # torch.compile fuses ops for ~10-30% additional speedup, but
         # xlm-roberta-flash models (jina-embeddings-v3 family, jina-clip-* text
         # tower) mutate an internal rotary _cos_cached tensor inside the forward
@@ -169,9 +189,7 @@ class EmbeddingsV5Family(SentenceTransformerFamily):
         # For omni the .query/.passage suffix is forwarded via prompt_name;
         # v5-text has no prompts map so prompt_name stays None.
         task = task or tasks.default_task(self.spec.family)
-        return tasks.V5_TASKS.get(task, "retrieval"), tasks.map_prompt_name(
-            task, self.prompts
-        )
+        return tasks.v5_task(task), tasks.map_prompt_name(task, self.prompts)
 
 
 class EmbeddingsV5OmniFamily(EmbeddingsV5Family):
