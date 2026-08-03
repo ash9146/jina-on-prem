@@ -45,6 +45,13 @@ import numpy as np
 #    calls don't prompt for interactive confirmation in offline containers.
 # 2. add_generation_mixin_to_remote_model: guard against models without
 #    prepare_inputs_for_generation (embedding-only models like JinaEmbeddingsV5).
+# 3. _patch_mistral_regex (transformers 4.57.3 only; absent in 4.56.2-4.57.2):
+#    calls huggingface_hub.model_info(repo_id) to sniff base-mistral tokenizers
+#    by tag whenever the tokenizer is loaded by repo id rather than by path.
+#    jina-reranker-v3.5's rerank() re-loads its own tokenizer by name, so an
+#    air-gapped container hits it and raises OfflineModeIsEnabled. No Jina model
+#    is a base-mistral model, so when offline we skip the probe and return the
+#    tokenizer unchanged — the regex fix is a no-op for non-mistral tokenizers.
 try:
     from transformers import dynamic_module_utils as _dmu
     _orig_resolve = _dmu.resolve_trust_remote_code
@@ -62,6 +69,17 @@ try:
                 return model_class
             return _orig_add_gen(model_class)
         _af.add_generation_mixin_to_remote_model = _safe_add_gen
+except Exception:
+    pass
+try:
+    from transformers.tokenization_utils_base import PreTrainedTokenizerBase as _PTTB
+    _orig_patch_mistral = getattr(_PTTB, "_patch_mistral_regex", None)
+    if _orig_patch_mistral is not None:
+        def _safe_patch_mistral(tokenizer, *args, **kwargs):
+            if os.environ.get("HF_HUB_OFFLINE") == "1" or os.environ.get("TRANSFORMERS_OFFLINE") == "1":
+                return tokenizer
+            return _orig_patch_mistral(tokenizer, *args, **kwargs)
+        _PTTB._patch_mistral_regex = staticmethod(_safe_patch_mistral)
 except Exception:
     pass
 
@@ -984,14 +1002,15 @@ def _is_colbert_model() -> bool:
 
 
 def _is_reranker_v3() -> bool:
-    """jina-reranker-v3 is a Qwen3-based listwise reranker with a custom
+    """jina-reranker-v3 / v3.5 are Qwen3-based listwise rerankers with a custom
     JinaForRanking class (auto_map.AutoModel -> modeling.JinaForRanking) that
-    exposes its own ``.rerank(query, documents)``. It is NOT a
-    sentence-transformers CrossEncoder, so it needs a dedicated load + rerank
-    branch separate from the generic reranker path.
+    exposes its own ``.rerank(query, documents)``. They are NOT
+    sentence-transformers CrossEncoders, so they need a dedicated load + rerank
+    branch separate from the generic reranker path. v3.5 is a drop-in upgrade:
+    same class, same interface, per-item truncation baked into its own rerank().
     """
     short = MODEL_ID.split("/")[-1] if MODEL_ID else ""
-    return short == "jina-reranker-v3"
+    return short in ("jina-reranker-v3", "jina-reranker-v3.5")
 
 
 def load_model():
