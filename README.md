@@ -205,8 +205,6 @@ jina-on-prem/
   - pull-prebuilt.sh       # pull GHCR image + save tar.gz for offline transport
   - gen_catalog_md.py      # regenerate the Model Catalog wiki page
   - benchmark.py           # throughput benchmark
-- tests/
-  - test_e2e.py            # E2E air-gap tests
 - test_airgap.sh             # quick sanity check on a built image
 ```
 

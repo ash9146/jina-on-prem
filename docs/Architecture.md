@@ -152,7 +152,6 @@ jina-on-prem/
   - sync-wiki.sh             push docs/ to the wiki
   - benchmark.py             throughput micro-benchmark
 - docs/                      mirror of this wiki, edited via PRs
-- tests/test_e2e.py          E2E API tests
 - test_airgap.sh             quick smoke test for a built image
 ```
 

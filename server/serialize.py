@@ -11,8 +11,8 @@ The envelope, as ``api.jina.ai`` returns it:
     {"model": ..., "object": "list", "usage": {...}, "results": [...]}
 
 Key order matches the wire. It does not affect JSON equality, but it makes a
-diff against a captured response readable. ``tests/test_contracts.py`` pins
-every value here against one.
+diff against a captured response readable, and every value here is pinned
+against a real one.
 """
 
 import base64

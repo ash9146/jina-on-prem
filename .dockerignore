@@ -5,8 +5,7 @@
 .git
 .gitignore
 
-# Tests and scripts (not needed at runtime)
-tests/
+# Scripts (not needed at runtime)
 scripts/
 
 # Documentation
